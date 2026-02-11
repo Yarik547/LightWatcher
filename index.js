@@ -1,5 +1,4 @@
 import axios from "axios";
-import * as cheerio from "cheerio";
 import fs from "node:fs";
 import path from "node:path";
 import { Telegraf, Markup } from "telegraf";
@@ -10,206 +9,141 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN env");
 
 const TARGET_URL = process.env.TARGET_URL || "https://poweron.loe.lviv.ua/";
-const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 300_000);
+const CHECK_INTERVAL_MS = 300_000; // 5 хвилин
 
-const DATA_DIR = process.env.DATA_DIR || path.resolve("./data");
-const SUBSCRIBERS_FILE = path.join(DATA_DIR, "subscribers.json");
+const DATA_DIR = path.resolve("./data");
+const SUBS_FILE = path.join(DATA_DIR, "subscribers.json");
+const CACHE_FILE = path.join(DATA_DIR, "last_graph.json");
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// --- Ініціалізація бази ---
-function ensureDataDir() {
-	if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-	if (!fs.existsSync(SUBSCRIBERS_FILE))
-		fs.writeFileSync(SUBSCRIBERS_FILE, "[]", "utf-8");
-}
+// --- Сховище в пам'яті (кеш) ---
+let cachedGraph = { url: null, time: null };
 
-function loadSubscribers() {
-	ensureDataDir();
+// --- Ініціалізація бази ---
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (fs.existsSync(CACHE_FILE))
+	cachedGraph = JSON.parse(fs.readFileSync(CACHE_FILE, "utf-8"));
+
+function loadSubs() {
 	try {
-		const raw = fs.readFileSync(SUBSCRIBERS_FILE, "utf-8");
-		const arr = JSON.parse(raw);
-		return new Set(
-			(Array.isArray(arr) ? arr : []).map(Number).filter(Number.isFinite),
-		);
+		return new Set(JSON.parse(fs.readFileSync(SUBS_FILE, "utf-8")));
 	} catch {
 		return new Set();
 	}
 }
 
-function saveSubscribers(set) {
-	ensureDataDir();
-	fs.writeFileSync(
-		SUBSCRIBERS_FILE,
-		JSON.stringify([...set], null, 2),
-		"utf-8",
-	);
+function saveSubs(set) {
+	fs.writeFileSync(SUBS_FILE, JSON.stringify([...set]));
 }
 
-let subscribers = loadSubscribers();
+let subscribers = loadSubs();
 
-// --- Допоміжні функції ---
-function kb() {
-	return Markup.inlineKeyboard([
-		Markup.button.callback("📊 Графік зараз", "SCHEDULE_NOW"),
-	]);
-}
-
-function nowText() {
-	const d = new Date();
-	const pad = (n) => String(n).padStart(2, "0");
-	return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-}
-
-// --- Головна логіка парсингу ---
-async function fetchScheduleImageUrl() {
-	console.log(`[${nowText()}] Запуск Puppeteer на сервері...`);
-
+// --- Робота з браузером ---
+async function fetchGraph() {
+	console.log(`[${new Date().toLocaleTimeString()}] Спроба парсингу...`);
 	const browser = await puppeteer.launch({
 		headless: "new",
-		executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null,
 		args: [
 			"--no-sandbox",
 			"--disable-setuid-sandbox",
 			"--disable-dev-shm-usage",
-			"--single-process",
-			"--no-zygote",
-			"--disable-blink-features=AutomationControlled", // Приховує ознаки автоматизації
+			"--disable-blink-features=AutomationControlled",
 		],
 	});
 
 	try {
 		const page = await browser.newPage();
-
-		// Встановлюємо реалістичні заголовки
 		await page.setUserAgent(
-			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 		);
-		await page.setExtraHTTPHeaders({
-			"Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
-		});
 
-		// Переходимо на сайт
+		// Railway іноді потребує більше часу на DNS
 		await page.goto(TARGET_URL, {
-			waitUntil: "networkidle2", // Чекаємо, поки мережа затихне
+			waitUntil: "networkidle2",
 			timeout: 60000,
 		});
 
-		// Важливо: На Railway даємо більше часу (15 сек) для відпрацювання JS
-		console.log("Очікування рендерингу (15 секунд)...");
+		// Чекаємо рендерингу віджетів
 		await new Promise((r) => setTimeout(r, 15000));
 
-		let src = await page.evaluate(() => {
-			const container = document.querySelector(".power-off__current");
-			if (!container) return null;
-
-			const link = container.querySelector("a");
-			if (link && link.href && link.href.includes("api.loe"))
-				return link.href;
-
-			const img = container.querySelector("img");
-			return img ? img.src : null;
+		const data = await page.evaluate(() => {
+			const el =
+				document.querySelector(".power-off__current a") ||
+				document.querySelector(".power-off__current img");
+			return el ? el.href || el.src : null;
 		});
 
-		if (!src) {
-			console.log("Елемент не знайдено, роблю дебаг-скріншот...");
-			await page.screenshot({
-				path: path.join(DATA_DIR, "debug.png"),
-				fullPage: true,
-			});
+		if (data) {
+			cachedGraph = {
+				url: data,
+				time: new Date().toLocaleString("uk-UA"),
+			};
+			fs.writeFileSync(CACHE_FILE, JSON.stringify(cachedGraph));
 		}
-
-		return src;
-	} catch (error) {
-		console.error("Помилка Puppeteer:", error.message);
+		return data;
+	} catch (e) {
+		console.error("Puppeteer Error:", e.message);
 		return null;
 	} finally {
 		await browser.close();
 	}
 }
 
-async function sendScheduleToChat(chatId, imageUrl, extraText = "") {
-	const caption = `💡 *Графік оновлено* \n🕒 ${nowText()}${extraText ? `\n\n_${extraText}_` : ""}`;
-	await bot.telegram.sendPhoto(chatId, imageUrl, {
+// --- Повідомлення ---
+async function sendGraph(chatId, isUpdate = false) {
+	if (!cachedGraph.url) {
+		return bot.telegram.sendMessage(
+			chatId,
+			"⚠️ Графік ще не завантажено. Спробую ще раз за кілька хвилин.",
+		);
+	}
+
+	const caption = isUpdate
+		? `🆕 *ГРАФІК ОНОВЛЕНО!*\n🕒 Стан на: ${cachedGraph.time}`
+		: `📊 *Поточний графік*\n🕒 Останнє оновлення: ${cachedGraph.time}`;
+
+	await bot.telegram.sendPhoto(chatId, cachedGraph.url, {
 		caption,
 		parse_mode: "Markdown",
-		...kb(),
+		...Markup.inlineKeyboard([
+			Markup.button.callback("🔄 Оновити зараз", "SCHEDULE_NOW"),
+		]),
 	});
 }
 
-// --- Фонова перевірка ---
-let lastImageUrl = null;
+// --- Цикл перевірки ---
+async function checkUpdates() {
+	const oldUrl = cachedGraph.url;
+	const newUrl = await fetchGraph();
 
-async function checkAndBroadcast() {
-	try {
-		const imageUrl = await fetchScheduleImageUrl();
-		if (imageUrl && imageUrl !== lastImageUrl) {
-			lastImageUrl = imageUrl;
-			console.log("Новий графік знайдено! Розсилаю...");
-			for (const chatId of subscribers) {
-				try {
-					await sendScheduleToChat(chatId, imageUrl);
-				} catch (e) {
-					if (
-						e.description?.includes("blocked") ||
-						e.description?.includes("chat not found")
-					) {
-						subscribers.delete(chatId);
-						saveSubscribers(subscribers);
-					}
-				}
-			}
-		} else {
-			console.log("Змін немає.");
+	if (newUrl && newUrl !== oldUrl) {
+		console.log("Оновлення знайдено! Розсилка...");
+		for (const id of subscribers) {
+			sendGraph(id, true).catch(() => {});
 		}
-	} catch (e) {
-		console.error("Помилка автоматичної перевірки:", e.message);
 	}
 }
 
 // --- Команди ---
 bot.start(async (ctx) => {
 	subscribers.add(ctx.chat.id);
-	saveSubscribers(subscribers);
-	await ctx.reply(
-		"Бот активовано! Я надішлю графік, коли він з'явиться або оновиться на сайті ЛОЕ.",
-		kb(),
-	);
+	saveSubs(subscribers);
+	await ctx.reply("Бот активовано! Я перевіряю сайт ЛОЕ кожні 5 хвилин.");
+	sendGraph(ctx.chat.id);
 });
 
 bot.action("SCHEDULE_NOW", async (ctx) => {
-	await ctx.answerCbQuery("Звертаюсь до сайту ЛОЕ...").catch(() => {});
-	try {
-		const url = await fetchScheduleImageUrl();
-		if (url) {
-			await sendScheduleToChat(ctx.chat.id, url, "Актуальний графік:");
-		} else {
-			await ctx.reply(
-				"На жаль, сайт ЛОЕ не віддав графік (можливо, він перевантажений). Спробуйте ще раз за хвилину.",
-			);
-		}
-	} catch (e) {
-		await ctx.reply("Виникла технічна помилка.");
-	}
+	await ctx.answerCbQuery("Перевіряю стан...").catch(() => {});
+	// Спочатку шлемо кеш (миттєво)
+	await sendGraph(ctx.chat.id);
+	// Потім запускаємо фонову перевірку, якщо кеш старий (опціонально)
 });
 
-bot.on("text", async (ctx) => {
-	const t = ctx.message.text.toLowerCase();
-	if (t.includes("графік") || t.includes("світло")) {
-		const url = await fetchScheduleImageUrl();
-		if (url) await sendScheduleToChat(ctx.chat.id, url);
-		else await ctx.reply("Графік не знайдено на сторінці.");
-	}
-});
-
-// --- Запуск ---
-// Очищення старих сесій Telegram для запобігання помилці 409
+// --- Старт ---
 await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-
 bot.launch().then(() => {
-	console.log("Бот успішно працює!");
-	setInterval(checkAndBroadcast, CHECK_INTERVAL_MS);
+	console.log("Бот запущений");
+	checkUpdates();
+	setInterval(checkUpdates, CHECK_INTERVAL_MS);
 });
-
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
