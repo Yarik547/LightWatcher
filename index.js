@@ -7,18 +7,12 @@ import { Telegraf, Markup } from "telegraf";
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN env");
 
-const TARGET_URL = process.env.TARGET_URL || "https://poweron.loe.lviv.ua/";
+const TARGET_URL =
+	process.env.TARGET_URL || "https://poweron.loe.lviv.ua/shedule-off"; // важливо [web:33]
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 60_000);
 
 const DATA_DIR = process.env.DATA_DIR || path.resolve("./data");
 const SUBSCRIBERS_FILE = path.join(DATA_DIR, "subscribers.json");
-
-// кілька варіантів, бо на скріні було power-off__current
-const IMG_SELECTORS = [
-	".power-off__current img",
-	".power-off_current img",
-	".power-off img",
-];
 
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -61,7 +55,9 @@ function kb() {
 function nowText() {
 	const d = new Date();
 	const pad = (n) => String(n).padStart(2, "0");
-	return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+	return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(
+		d.getMinutes(),
+	)}:${pad(d.getSeconds())}`;
 }
 
 async function fetchScheduleImageUrl() {
@@ -74,8 +70,7 @@ async function fetchScheduleImageUrl() {
 			Pragma: "no-cache",
 		},
 		timeout: 25_000,
-		// якщо сайт редіректить — axios в Node вміє йти за редіректом (maxRedirects) [web:89]
-		maxRedirects: 5,
+		maxRedirects: 5, // axios node підтримує maxRedirects [web:89]
 		validateStatus: (s) => s >= 200 && s < 400,
 	});
 
@@ -86,21 +81,28 @@ async function fetchScheduleImageUrl() {
 
 	const $ = cheerio.load(html);
 
-	let src = null;
-	for (const sel of IMG_SELECTORS) {
-		src = $(sel).attr("src");
-		if (src) {
-			console.log("FOUND selector:", sel);
-			break;
+	// Основний варіант: картинка графіка зазвичай з api.loe.lviv.ua/media
+	let src =
+		$("img[src*='api.loe.lviv.ua/media']").first().attr("src") ||
+		$("a[href*='api.loe.lviv.ua/media']").first().attr("href") ||
+		null;
+
+	// Fallback: якщо верстка зміниться — спробуємо кілька старих варіантів
+	if (!src) {
+		const selectors = [
+			".power-off__current img",
+			".power-off_current img",
+			".power-off img",
+		];
+		for (const sel of selectors) {
+			src = $(sel).attr("src");
+			if (src) break;
 		}
 	}
 
 	if (!src) {
-		// часто в таких кейсах приходить заглушка (“технічні роботи”), тому виводимо підказку [web:74]
 		const title = ($("title").text() || "").trim();
-		throw new Error(
-			`Не знайшов картинку. selectors=[${IMG_SELECTORS.join(", ")}], title="${title}"`,
-		);
+		throw new Error(`Не знайшов картинку на сторінці. title="${title}"`);
 	}
 
 	if (src.startsWith("http://") || src.startsWith("https://")) return src;
@@ -121,6 +123,8 @@ let lastErrorNotifiedAt = 0;
 async function checkAndBroadcast() {
 	try {
 		const imageUrl = await fetchScheduleImageUrl();
+
+		// твоя логіка: якщо URL змінився — шлемо, якщо ні — мовчимо
 		if (imageUrl && imageUrl !== lastImageUrl) {
 			lastImageUrl = imageUrl;
 
@@ -129,6 +133,7 @@ async function checkAndBroadcast() {
 				try {
 					await sendScheduleToChat(chatId, imageUrl);
 				} catch (e) {
+					// якщо бот заблокували/чат зник — видаляємо, щоб не падати постійно
 					const msg = String(
 						e?.response?.description || e?.message || "",
 					);
@@ -144,6 +149,8 @@ async function checkAndBroadcast() {
 		}
 	} catch (e) {
 		console.error("CHECK ERR:", e?.message || e);
+
+		// щоб не спамити щохвилини: максимум 1 повідомлення про помилку на 15 хв
 		const now = Date.now();
 		if (now - lastErrorNotifiedAt > 15 * 60_000) {
 			lastErrorNotifiedAt = now;
@@ -160,6 +167,7 @@ async function checkAndBroadcast() {
 	}
 }
 
+// /start — підписуємо користувача і одразу віддаємо поточний графік
 bot.start(async (ctx) => {
 	const chatId = ctx.chat.id;
 	subscribers.add(chatId);
@@ -182,6 +190,7 @@ bot.start(async (ctx) => {
 	}
 });
 
+// /status — для дебагу
 bot.command("status", async (ctx) => {
 	const text =
 		`Підписників: ${subscribers.size}\n` +
@@ -191,8 +200,9 @@ bot.command("status", async (ctx) => {
 	await ctx.reply(text, kb());
 });
 
+// кнопка
 bot.action("SCHEDULE_NOW", async (ctx) => {
-	await ctx.answerCbQuery(); // щоб кнопка не “крутилась” [web:52]
+	await ctx.answerCbQuery(); // прибирає “spinner” на кнопці [web:52]
 	const chatId = ctx.chat.id;
 
 	subscribers.add(chatId);
@@ -210,6 +220,7 @@ bot.action("SCHEDULE_NOW", async (ctx) => {
 	}
 });
 
+// текстом
 bot.on("text", async (ctx) => {
 	const chatId = ctx.chat.id;
 	subscribers.add(chatId);
@@ -235,6 +246,7 @@ bot.on("text", async (ctx) => {
 	}
 });
 
+// старт
 await bot.launch();
 console.log("Bot started");
 
