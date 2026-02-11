@@ -7,8 +7,7 @@ import { Telegraf, Markup } from "telegraf";
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN env");
 
-const TARGET_URL =
-	process.env.TARGET_URL || "https://poweron.loe.lviv.ua/shedule-off"; // важливо [web:33]
+const TARGET_URL = process.env.TARGET_URL || "https://poweron.loe.lviv.ua/"; // важливо [web:33]
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 60_000);
 
 const DATA_DIR = process.env.DATA_DIR || path.resolve("./data");
