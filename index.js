@@ -3,17 +3,21 @@ import * as cheerio from "cheerio";
 import fs from "node:fs";
 import path from "node:path";
 import { Telegraf, Markup } from "telegraf";
+import puppeteer from "puppeteer";
+import "dotenv/config";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN env");
 
-const TARGET_URL = process.env.TARGET_URL || "https://poweron.loe.lviv.ua/"; // важливо [web:33]
+const TARGET_URL = process.env.TARGET_URL || "https://poweron.loe.lviv.ua/";
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 60_000);
 
 const DATA_DIR = process.env.DATA_DIR || path.resolve("./data");
 const SUBSCRIBERS_FILE = path.join(DATA_DIR, "subscribers.json");
 
 const bot = new Telegraf(BOT_TOKEN);
+
+// --- Робота з базою підписників ---
 
 function ensureDataDir() {
 	if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -45,76 +49,90 @@ function saveSubscribers(set) {
 
 let subscribers = loadSubscribers();
 
+// --- Допоміжні функції ---
+
 function kb() {
 	return Markup.inlineKeyboard([
-		Markup.button.callback("Графік зараз", "SCHEDULE_NOW"),
+		Markup.button.callback("📊 Графік зараз", "SCHEDULE_NOW"),
 	]);
 }
 
 function nowText() {
 	const d = new Date();
 	const pad = (n) => String(n).padStart(2, "0");
-	return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(
-		d.getMinutes(),
-	)}:${pad(d.getSeconds())}`;
+	return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
+// --- Головна логіка парсингу через Puppeteer ---
+
 async function fetchScheduleImageUrl() {
-	const res = await axios.get(TARGET_URL, {
-		headers: {
-			"User-Agent": "Mozilla/5.0",
-			Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-			"Accept-Language": "uk-UA,uk;q=0.9,en;q=0.7",
-			"Cache-Control": "no-cache",
-			Pragma: "no-cache",
-		},
-		timeout: 25_000,
-		maxRedirects: 5, // axios node підтримує maxRedirects [web:89]
-		validateStatus: (s) => s >= 200 && s < 400,
+	console.log(`[${nowText()}] Запуск браузера для перевірки сайту...`);
+
+	// Запускаємо браузер (headless: true означає без вікна)
+	const browser = await puppeteer.launch({
+		headless: "new",
+		executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null, // Важливо для деяких оточень
+		args: [
+			"--no-sandbox",
+			"--disable-setuid-sandbox",
+			"--disable-dev-shm-usage", // Вирішує проблему з нестачею пам'яті в Docker
+			"--single-process", // Економить ресурси на Railway
+			"--no-zygote",
+		],
 	});
+	try {
+		const page = await browser.newPage();
 
-	const html = String(res.data || "");
-	console.log("FETCH", TARGET_URL);
-	console.log("HTTP", res.status, "len", html.length);
-	console.log("HTML head:", html.slice(0, 400));
+		// Маскуємося під звичайного користувача
+		await page.setUserAgent(
+			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		);
 
-	const $ = cheerio.load(html);
+		// Переходимо на сайт і чекаємо на завантаження мережі
+		await page.goto(TARGET_URL, {
+			waitUntil: "networkidle2",
+			timeout: 45000,
+		});
 
-	// Основний варіант: картинка графіка зазвичай з api.loe.lviv.ua/media
-	let src =
-		$("img[src*='api.loe.lviv.ua/media']").first().attr("src") ||
-		$("a[href*='api.loe.lviv.ua/media']").first().attr("href") ||
-		null;
+		// Чекаємо саме на той клас, який ми бачили в інспекторі
+		console.log("Очікую на появу елемента .power-off__current...");
+		await page.waitForSelector(".power-off__current", { timeout: 20000 });
 
-	// Fallback: якщо верстка зміниться — спробуємо кілька старих варіантів
-	if (!src) {
-		const selectors = [
-			".power-off__current img",
-			".power-off_current img",
-			".power-off img",
-		];
-		for (const sel of selectors) {
-			src = $(sel).attr("src");
-			if (src) break;
+		// Витягуємо дані прямо з DOM браузера
+		const src = await page.evaluate(() => {
+			const link = document.querySelector(".power-off__current a");
+			if (link && link.href) return link.href;
+
+			const img = document.querySelector(".power-off__current img");
+			return img ? img.src : null;
+		});
+
+		if (!src) {
+			throw new Error(
+				"Контейнер знайдено, але посилання на картинку відсутнє.",
+			);
 		}
-	}
 
-	if (!src) {
-		const title = ($("title").text() || "").trim();
-		throw new Error(`Не знайшов картинку на сторінці. title="${title}"`);
+		console.log(`Успішно знайдено: ${src}`);
+		return src;
+	} catch (error) {
+		console.error("Помилка при роботі Puppeteer:", error.message);
+		throw error;
+	} finally {
+		await browser.close();
 	}
-
-	if (src.startsWith("http://") || src.startsWith("https://")) return src;
-	return new URL(src, TARGET_URL).toString();
 }
 
 async function sendScheduleToChat(chatId, imageUrl, extraText = "") {
-	const caption = `Оновлено: ${nowText()}${extraText ? `\n${extraText}` : ""}`;
+	const caption = `💡 *Графік оновлено* \n🕒 ${nowText()}${extraText ? `\n\n_${extraText}_` : ""}`;
 	await bot.telegram.sendPhoto(chatId, imageUrl, {
 		caption,
-		reply_markup: kb().reply_markup,
+		parse_mode: "Markdown",
+		...kb(),
 	});
 }
+
+// --- Фонова перевірка ---
 
 let lastImageUrl = null;
 let lastErrorNotifiedAt = 0;
@@ -123,16 +141,14 @@ async function checkAndBroadcast() {
 	try {
 		const imageUrl = await fetchScheduleImageUrl();
 
-		// твоя логіка: якщо URL змінився — шлемо, якщо ні — мовчимо
 		if (imageUrl && imageUrl !== lastImageUrl) {
+			console.log("Графік змінився! Починаю розсилку...");
 			lastImageUrl = imageUrl;
 
-			const ids = [...subscribers];
-			for (const chatId of ids) {
+			for (const chatId of subscribers) {
 				try {
 					await sendScheduleToChat(chatId, imageUrl);
 				} catch (e) {
-					// якщо бот заблокували/чат зник — видаляємо, щоб не падати постійно
 					const msg = String(
 						e?.response?.description || e?.message || "",
 					);
@@ -145,111 +161,74 @@ async function checkAndBroadcast() {
 					}
 				}
 			}
+		} else {
+			console.log("Змін у графіку не виявлено.");
 		}
 	} catch (e) {
-		console.error("CHECK ERR:", e?.message || e);
-
-		// щоб не спамити щохвилини: максимум 1 повідомлення про помилку на 15 хв
 		const now = Date.now();
-		if (now - lastErrorNotifiedAt > 15 * 60_000) {
+		if (now - lastErrorNotifiedAt > 30 * 60_000) {
+			// Повідомляємо про помилку не частіше ніж раз на 30 хв
 			lastErrorNotifiedAt = now;
-			const ids = [...subscribers];
-			for (const chatId of ids) {
-				try {
-					await bot.telegram.sendMessage(
-						chatId,
-						`Помилка при перевірці сайту, спробую знову.\nДеталі: ${e.message}`,
-					);
-				} catch {}
-			}
+			console.error("Критична помилка моніторингу:", e.message);
 		}
 	}
 }
 
-// /start — підписуємо користувача і одразу віддаємо поточний графік
-bot.start(async (ctx) => {
-	const chatId = ctx.chat.id;
-	subscribers.add(chatId);
-	saveSubscribers(subscribers);
+// --- Команди бота ---
 
+bot.start(async (ctx) => {
+	subscribers.add(ctx.chat.id);
+	saveSubscribers(subscribers);
 	await ctx.reply(
-		"Привіт! Я надсилатиму оновлення графіка, коли він зміниться.\nНатисни кнопку нижче або напиши “графік”.",
+		"Привіт! Я моніторю сайт ЛОЕ. Як тільки графік оновиться — я надішлю його вам.",
 		kb(),
 	);
 
 	try {
-		const imageUrl = await fetchScheduleImageUrl();
-		lastImageUrl = imageUrl;
-		await sendScheduleToChat(chatId, imageUrl, "Поточний графік.");
+		const url = await fetchScheduleImageUrl();
+		lastImageUrl = url;
+		await sendScheduleToChat(
+			ctx.chat.id,
+			url,
+			"Поточний графік на цей момент:",
+		);
 	} catch (e) {
 		await ctx.reply(
-			`Не зміг отримати графік зараз. Помилка: ${e.message}`,
-			kb(),
+			"Сайт зараз не віддає графік, але я підписав вас на оновлення.",
 		);
 	}
 });
 
-// /status — для дебагу
-bot.command("status", async (ctx) => {
-	const text =
-		`Підписників: ${subscribers.size}\n` +
-		`Останній URL: ${lastImageUrl || "ще немає"}\n` +
-		`Сайт: ${TARGET_URL}\n` +
-		`Інтервал: ${Math.round(CHECK_INTERVAL_MS / 1000)} сек`;
-	await ctx.reply(text, kb());
-});
-
-// кнопка
 bot.action("SCHEDULE_NOW", async (ctx) => {
-	await ctx.answerCbQuery(); // прибирає “spinner” на кнопці [web:52]
-	const chatId = ctx.chat.id;
-
-	subscribers.add(chatId);
-	saveSubscribers(subscribers);
-
+	await ctx.answerCbQuery("Зачекайте, запускаю браузер...");
 	try {
-		const imageUrl = await fetchScheduleImageUrl();
-		lastImageUrl = imageUrl;
-		await sendScheduleToChat(chatId, imageUrl, "Запит вручну.");
+		const url = await fetchScheduleImageUrl();
+		await sendScheduleToChat(ctx.chat.id, url, "Ваш запит вручну:");
 	} catch (e) {
-		await ctx.reply(
-			`Помилка, спробуй знову пізніше.\nДеталі: ${e.message}`,
-			kb(),
-		);
+		await ctx.reply(`Не вдалося отримати графік: ${e.message}`);
 	}
 });
 
-// текстом
 bot.on("text", async (ctx) => {
-	const chatId = ctx.chat.id;
-	subscribers.add(chatId);
-	saveSubscribers(subscribers);
-
-	const t = (ctx.message.text || "").toLowerCase();
-	if (t.includes("графік") || t.includes("зараз") || t.includes("schedule")) {
+	const t = ctx.message.text.toLowerCase();
+	if (t.includes("графік") || t.includes("зараз")) {
 		try {
-			const imageUrl = await fetchScheduleImageUrl();
-			lastImageUrl = imageUrl;
-			await sendScheduleToChat(chatId, imageUrl, "Запит текстом.");
+			const url = await fetchScheduleImageUrl();
+			await sendScheduleToChat(ctx.chat.id, url);
 		} catch (e) {
-			await ctx.reply(
-				`Помилка, спробуй знову.\nДеталі: ${e.message}`,
-				kb(),
-			);
+			await ctx.reply("Помилка при отриманні. Спробуйте через хвилину.");
 		}
-	} else {
-		await ctx.reply(
-			"Напиши “графік” або натисни кнопку “Графік зараз”.",
-			kb(),
-		);
 	}
 });
 
-// старт
-await bot.launch();
-console.log("Bot started");
+// --- Запуск ---
 
-setInterval(checkAndBroadcast, CHECK_INTERVAL_MS);
+bot.launch().then(() => {
+	console.log("Бот успішно запущений через Puppeteer!");
+	// Перша перевірка через 5 секунд після старту, далі за інтервалом
+	setTimeout(checkAndBroadcast, 5000);
+	setInterval(checkAndBroadcast, CHECK_INTERVAL_MS);
+});
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
