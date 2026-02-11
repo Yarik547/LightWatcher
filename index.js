@@ -13,7 +13,12 @@ const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 60_000);
 const DATA_DIR = process.env.DATA_DIR || path.resolve("./data");
 const SUBSCRIBERS_FILE = path.join(DATA_DIR, "subscribers.json");
 
-const IMG_SELECTOR = ".power-off_current img"; // як на твоєму скріні
+// кілька варіантів, бо на скріні було power-off__current
+const IMG_SELECTORS = [
+	".power-off__current img",
+	".power-off_current img",
+	".power-off img",
+];
 
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -53,27 +58,53 @@ function kb() {
 	]);
 }
 
-async function fetchScheduleImageUrl() {
-	const res = await axios.get(TARGET_URL, {
-		headers: { "User-Agent": "Mozilla/5.0" },
-		timeout: 20_000,
-	});
-
-	const $ = cheerio.load(res.data);
-	const src = $(IMG_SELECTOR).attr("src");
-	if (!src)
-		throw new Error(`Не знайшов картинку за селектором: ${IMG_SELECTOR}`);
-
-	// src вже абсолютний у цього сайту, але на всяк випадок:
-	if (src.startsWith("http://") || src.startsWith("https://")) return src;
-	return new URL(src, TARGET_URL).toString();
-}
-
 function nowText() {
-	// Простий timestamp без залежностей
 	const d = new Date();
 	const pad = (n) => String(n).padStart(2, "0");
 	return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+async function fetchScheduleImageUrl() {
+	const res = await axios.get(TARGET_URL, {
+		headers: {
+			"User-Agent": "Mozilla/5.0",
+			Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+			"Accept-Language": "uk-UA,uk;q=0.9,en;q=0.7",
+			"Cache-Control": "no-cache",
+			Pragma: "no-cache",
+		},
+		timeout: 25_000,
+		// якщо сайт редіректить — axios в Node вміє йти за редіректом (maxRedirects) [web:89]
+		maxRedirects: 5,
+		validateStatus: (s) => s >= 200 && s < 400,
+	});
+
+	const html = String(res.data || "");
+	console.log("FETCH", TARGET_URL);
+	console.log("HTTP", res.status, "len", html.length);
+	console.log("HTML head:", html.slice(0, 400));
+
+	const $ = cheerio.load(html);
+
+	let src = null;
+	for (const sel of IMG_SELECTORS) {
+		src = $(sel).attr("src");
+		if (src) {
+			console.log("FOUND selector:", sel);
+			break;
+		}
+	}
+
+	if (!src) {
+		// часто в таких кейсах приходить заглушка (“технічні роботи”), тому виводимо підказку [web:74]
+		const title = ($("title").text() || "").trim();
+		throw new Error(
+			`Не знайшов картинку. selectors=[${IMG_SELECTORS.join(", ")}], title="${title}"`,
+		);
+	}
+
+	if (src.startsWith("http://") || src.startsWith("https://")) return src;
+	return new URL(src, TARGET_URL).toString();
 }
 
 async function sendScheduleToChat(chatId, imageUrl, extraText = "") {
@@ -90,7 +121,6 @@ let lastErrorNotifiedAt = 0;
 async function checkAndBroadcast() {
 	try {
 		const imageUrl = await fetchScheduleImageUrl();
-
 		if (imageUrl && imageUrl !== lastImageUrl) {
 			lastImageUrl = imageUrl;
 
@@ -99,7 +129,6 @@ async function checkAndBroadcast() {
 				try {
 					await sendScheduleToChat(chatId, imageUrl);
 				} catch (e) {
-					// Якщо бот заблокували або чат недоступний — прибираємо підписника
 					const msg = String(
 						e?.response?.description || e?.message || "",
 					);
@@ -114,8 +143,8 @@ async function checkAndBroadcast() {
 			}
 		}
 	} catch (e) {
+		console.error("CHECK ERR:", e?.message || e);
 		const now = Date.now();
-		// щоб не спамити щохвилини: максимум 1 повідомлення про помилку на 15 хв
 		if (now - lastErrorNotifiedAt > 15 * 60_000) {
 			lastErrorNotifiedAt = now;
 			const ids = [...subscribers];
@@ -131,7 +160,6 @@ async function checkAndBroadcast() {
 	}
 }
 
-// Команди
 bot.start(async (ctx) => {
 	const chatId = ctx.chat.id;
 	subscribers.add(chatId);
@@ -142,13 +170,15 @@ bot.start(async (ctx) => {
 		kb(),
 	);
 
-	// Одразу надішлемо поточний графік
 	try {
 		const imageUrl = await fetchScheduleImageUrl();
 		lastImageUrl = imageUrl;
 		await sendScheduleToChat(chatId, imageUrl, "Поточний графік.");
 	} catch (e) {
-		await ctx.reply(`Не зміг отримати графік зараз. Помилка: ${e.message}`);
+		await ctx.reply(
+			`Не зміг отримати графік зараз. Помилка: ${e.message}`,
+			kb(),
+		);
 	}
 });
 
@@ -162,7 +192,7 @@ bot.command("status", async (ctx) => {
 });
 
 bot.action("SCHEDULE_NOW", async (ctx) => {
-	await ctx.answerCbQuery(); // прибирає “spinner” на кнопці [web:52]
+	await ctx.answerCbQuery(); // щоб кнопка не “крутилась” [web:52]
 	const chatId = ctx.chat.id;
 
 	subscribers.add(chatId);
@@ -170,7 +200,7 @@ bot.action("SCHEDULE_NOW", async (ctx) => {
 
 	try {
 		const imageUrl = await fetchScheduleImageUrl();
-		lastImageUrl = imageUrl; // щоб одразу синхронізувати
+		lastImageUrl = imageUrl;
 		await sendScheduleToChat(chatId, imageUrl, "Запит вручну.");
 	} catch (e) {
 		await ctx.reply(
@@ -205,12 +235,10 @@ bot.on("text", async (ctx) => {
 	}
 });
 
-// Запуск
 await bot.launch();
 console.log("Bot started");
 
 setInterval(checkAndBroadcast, CHECK_INTERVAL_MS);
 
-// graceful stop
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
