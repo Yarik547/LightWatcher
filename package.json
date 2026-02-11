@@ -1,0 +1,14 @@
+{
+	"name": "loe-poweron-bot",
+	"version": "1.0.0",
+	"type": "module",
+	"main": "index.js",
+	"scripts": {
+		"start": "node index.js"
+	},
+	"dependencies": {
+		"axios": "^1.6.8",
+		"cheerio": "^1.0.0",
+		"telegraf": "^4.16.3"
+	}
+}
